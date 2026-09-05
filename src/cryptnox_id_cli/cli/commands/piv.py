@@ -40,7 +40,7 @@ from cryptnox_id_cli.secrets.resolver import resolve_scp03_keys, resolve_secret
 from cryptnox_id_cli.state import StateDetector
 from cryptnox_id_cli.transport.errors import CryptnoxError, StatusWordError, describe_sw
 from cryptnox_id_cli.util import tlv
-from cryptnox_id_cli.util.hexutil import to_hex
+from cryptnox_id_cli.util.hexutil import from_hex, to_hex
 
 # Slots that carry a certificate container, and the object that holds it.
 SLOT_CERT_OBJECT = {
@@ -98,15 +98,20 @@ def info(app: AppContext) -> None:
 @command.command("status")
 @click.pass_obj
 def status(app: AppContext) -> None:
-    """Show PIV lifecycle state, PIN/PUK status and which objects are present."""
+    """Show PIV lifecycle state, PIN/PUK/management-key status and objects present."""
     with app.open_session() as session:
         st = StateDetector(session, probe_fido=False, probe_desfire=False).detect()
+        mgmt_key = None
+        if st.piv_apt is not None:
+            with contextlib.suppress(CryptnoxError):
+                mgmt_key = _select(session).mgmt_key_status()
     payload: dict[str, object] = {
         "state": st.piv.label,
         "reader": app.resolved_reader,
         "apt": st.piv_apt.to_dict() if st.piv_apt else None,
         "pin": st.piv_pin.to_dict() if st.piv_pin else None,
         "puk": st.piv_puk.to_dict() if st.piv_puk else None,
+        "mgmt_key": mgmt_key.to_dict() if mgmt_key else None,
         "objects_present": st.piv_objects,
         "notes": st.notes,
     }
@@ -121,6 +126,16 @@ def status(app: AppContext) -> None:
             extra = f", {st.piv_puk.retries} tries left" if st.piv_puk.retries is not None else ""
             blocked = " [red](blocked)[/red]" if st.piv_puk.blocked else ""
             c.print(f"  PUK (81): {'set' if st.piv_puk.configured else 'not set'}{extra}{blocked}")
+        if mgmt_key:
+            mech_name = pivc.ALGORITHMS.get(mgmt_key.mechanism, "unknown mechanism")
+            if mgmt_key.configured is True:
+                c.print(f"  Management key (9B): [green]set[/green] ({mech_name})")
+            elif mgmt_key.configured is False:
+                c.print(f"  Management key (9B): [yellow]not set[/yellow] ({mech_name})")
+            else:
+                c.print("  Management key (9B): [dim]unknown[/dim] (could not tell from this probe)")
+        elif st.piv_apt is not None:
+            c.print("  Management key (9B): [dim]no admin key object found on this card[/dim]")
         if st.piv_objects:
             table = app.out.table("Object", "Present")
             for name, present in st.piv_objects.items():
@@ -1624,6 +1639,98 @@ def perso_set_puk(app: AppContext, pin_value: str | None, default_keys: bool) ->
     _set_verifier_value(
         app, pivc.REF_PUK, "PUK", "CRYPTNOX_PIV_NEW_PUK", "New PIV PUK", pin_value, default_keys
     )
+
+
+# Friendly diagnoses for CHANGE REFERENCE DATA ADMIN rejections while setting 9B.
+_MGMT_KEY_SW_HINTS = {
+    0x6A88: (
+        "no 9B key object at this mechanism - pass --algorithm matching whatever "
+        "pre-perso gave the admin key object (cryptnox-default: AES256)"
+    ),
+    0x6982: "the key object is not IMPORTABLE (or the admin channel is not accepted)",
+}
+
+
+def _execute_sym_key_set(
+    adm: PivAdmin, keys, ref: int, mech: int, plan: list[keyimport.KeyElement], label: str
+) -> list[dict[str, object]]:
+    """Send a symmetric-key element plan, one fresh SCP03 session per element
+    (JCOP 4.5 allows one application APDU per applet-directed secure-channel
+    session) — same shape as ``_execute_key_import``, minus the probe/create
+    step: unlike an asymmetric slot, 9B's key object is expected to already
+    exist from pre-perso, exactly like the PIN/PUK verifiers set-pin/set-puk
+    assume."""
+    results: list[dict[str, object]] = []
+    for index, el in enumerate(plan, 1):
+        adm.select()
+        adm.open(keys)
+        label_ctx = f"SET {label} [{el.label}] [{index}/{len(plan)}]"
+        resp = adm.send(keyimport.import_apdu(ref, mech, el), context=label_ctx)
+        results.append({"element": el.label, "sw": resp.sw_hex(), "ok": resp.ok})
+        if not resp.ok:
+            hint = _MGMT_KEY_SW_HINTS.get(resp.sw)
+            ctx = f"SET {label} [{el.label}]" + (f" - {hint}" if hint else "")
+            raise StatusWordError(resp.sw1, resp.sw2, context=ctx)
+    return results
+
+
+@perso.command("set-mgmt-key")
+@click.option(
+    "--algorithm",
+    default="AES256",
+    show_default=True,
+    type=click.Choice(["AES128", "AES192", "AES256"], case_sensitive=False),
+    help="Management key (9B) mechanism; must match what pre-perso gave the admin key object.",
+)
+@click.option(
+    "--key",
+    "key_value",
+    help="(discouraged) management key as hex on the CLI; "
+    "prefer env CRYPTNOX_PIV_MGMT_KEY or the prompt.",
+)
+@click.option(
+    "--default-keys",
+    is_flag=True,
+    help="Use the default GlobalPlatform TEST keys "
+    "(publicly known - fine for dev/eval, never for deployment).",
+)
+@click.pass_obj
+def perso_set_mgmt_key(
+    app: AppContext, algorithm: str, key_value: str | None, default_keys: bool
+) -> None:
+    """Set the PIV management key (9B). Set it for standards-compliance/
+    interoperability with tools that authenticate using 9B management key.
+    """
+    app.out.warn("replaces the current management key without needing its value (admin channel write).")
+    mech = prof_mod.MECHANISMS[algorithm.upper()]
+    expected_len = keyimport.aes_key_len(mech)
+    secret = resolve_secret(
+        redactor=app.redactor,
+        env_var="CRYPTNOX_PIV_MGMT_KEY",
+        prompt_label=f"New management key ({algorithm.upper()}, hex, {expected_len} bytes)",
+        provided=key_value,
+    )
+    try:
+        key_bytes = from_hex(secret.decode("ascii"))
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise click.BadParameter(f"management key must be hex: {exc}") from exc
+    app.redactor.register(key_bytes)
+    plan = keyimport.sym_key_plan(mech, key_bytes)
+    keys = resolve_scp03_keys(app.redactor, default_keys=default_keys)
+    with app.open_session() as session:
+        adm = PivAdmin(session)
+        results = _execute_sym_key_set(adm, keys, pivc.KEYREF_ADMIN, mech, plan, "management key")
+    payload = {
+        "ref": f"{pivc.KEYREF_ADMIN:02X}",
+        "algorithm": algorithm.upper(),
+        "set": True,
+        "elements": results,
+    }
+
+    def human(c: Console) -> None:
+        c.print(f"[green]Management key set.[/green] ({algorithm.upper()}, ref 9B)")
+
+    app.out.result(payload, human)
 
 
 def _resolve_asym_mech(algorithm: str) -> int:

@@ -14,7 +14,7 @@ Inspection
 .. code-block:: text
 
    piv info            applet AID/label, supported algorithms, key slots
-   piv status          lifecycle state, PIN/PUK status, object presence
+   piv status          lifecycle state, PIN/PUK/management-key status, object presence
    piv discover        the Discovery object (PIN usage policy)
    piv slots           key slots and which hold a certificate
    piv validate        consistency check (NOT a NIST/FIPS validation)
@@ -108,6 +108,7 @@ Personalization (``piv perso``)
 
    piv perso set-pin                 set the initial PIN (over SCP03)
    piv perso set-puk                 set the initial PUK (over SCP03)
+   piv perso set-mgmt-key            set the management key (9B, AES; over SCP03)
    piv perso generate-key            on-card key generation (per the slot's key objects)
    piv perso import-key              inject an externally generated private key
    piv perso import-p12              one-command PKCS#12 (.p12/.pfx) key + certificate import
@@ -143,3 +144,14 @@ Notes
   starts with a CLEAR, so re-runs are safe.
 * Large objects (certificates) are written with ISO command chaining
   automatically.
+* ``piv perso set-mgmt-key`` sets the AES value of key reference 9B, sent as
+  CHANGE REFERENCE DATA ADMIN elements over SCP03 (CLEAR, then the raw key —
+  same shape as ``import-key``; this admin command is SCP03-only, with no 9B
+  alternative. The applet does genuinely support 9B as the PIV standard's
+  management key (SP 800-73's Administration Key) for *standard* PIV writes
+  (``PUT DATA``, ``GENERATE ASYMMETRIC KEY PAIR``): those accept either an
+  open SCP03 admin session or a completed GENERAL AUTHENTICATE (INS 0x87)
+  challenge-response with 9B — the genuinely standard part. |cli| only ever
+  takes the SCP03 path itself. ``--algorithm`` must match the mechanism the
+  pre-personalization profile gave the admin key object (``cryptnox-default``:
+  AES256); a mismatch returns ``6A88``.

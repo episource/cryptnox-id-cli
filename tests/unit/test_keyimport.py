@@ -105,11 +105,35 @@ def test_chaining_threshold(rsa2048_key, p256_key):
     assert all(len(el.body()) <= ki.SINGLE_APDU_MAX for el in ecc_plan)
 
 
+def test_sym_key_plan_lengths():
+    assert ki.aes_key_len(0x08) == 16
+    assert ki.aes_key_len(0x0A) == 24
+    assert ki.aes_key_len(0x0C) == 32
+    assert ki.aes_key_len(0x11) is None  # not AES
+
+    plan = ki.sym_key_plan(0x0C, b"\x11" * 32)
+    assert [(el.tag, len(el.value)) for el in plan] == [(0x9F, 0), (0x80, 32)]
+    assert [el.secret for el in plan] == [False, True]
+
+
+def test_sym_key_plan_rejects_wrong_length_or_mechanism():
+    with pytest.raises(ki.KeyImportError):
+        ki.sym_key_plan(0x0C, b"\x11" * 16)  # AES-256 wants 32 bytes
+    with pytest.raises(ki.KeyImportError):
+        ki.sym_key_plan(0x11, b"\x11" * 32)  # ECCP256 is not AES
+
+
 # ------------------------------------------------------------------ APDUs --- #
 def test_clear_apdu_golden(p256_key):
     clear = ki.element_plan(p256_key)[0]
     apdu = ki.import_apdu(0x9C, 0x11, clear)
     assert apdu.to_bytes().hex().upper() == "0024119C029F00"
+
+
+def test_sym_key_apdu_golden():
+    key_element = ki.sym_key_plan(0x0C, b"\x11" * 32)[1]
+    apdu = ki.import_apdu(0x9B, 0x0C, key_element)
+    assert apdu.to_bytes().hex().upper() == "00240C9B228020" + "11" * 32
 
 
 def test_probe_apdu_golden():

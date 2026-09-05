@@ -82,6 +82,26 @@ Step 1 — set the PIN and PUK
    $ cryptnox-id piv perso set-pin --default-keys     # prompts (masked) for the new PIN
    $ cryptnox-id piv pin status                       # configured? retries?
 
+Step 1b — set the management key (optional)
+---------------------------------------------
+
+Key reference 9B holds an AES key (``cryptnox-default``: AES-256). The applet
+genuinely supports the PIV standard's management-key model (SP 800-73's
+Administration Key, key reference 9B): a standard PIV write (``PUT DATA`` on
+a container, ``GENERATE ASYMMETRIC KEY PAIR``) is authorized by *either* an
+open SCP03 admin session *or* a completed 9B challenge-response (every
+container/key in ``cryptnox-default`` is bound to 9B as its admin key). |cli|
+only ever takes the SCP03 path and never authenticates with 9B itself — a
+spec-compliant client that speaks GENERAL AUTHENTICATE with AES-256 (P1
+``0x0C``) could use the other path once 9B is set.
+
+.. code-block:: console
+
+   $ cryptnox-id piv perso set-mgmt-key --default-keys   # prompts (masked) for the new key, as hex
+
+The key value is raw AES key material (hex, sized to ``--algorithm``: 16/24/32 bytes).
+``--algorithm`` must match whatever pre-perso gave the admin key object.
+
 Step 2 — generate keys on the card
 -----------------------------------
 

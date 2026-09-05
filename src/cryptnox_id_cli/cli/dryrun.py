@@ -135,6 +135,7 @@ NO_DRY_RUN = frozenset(
         "piv perso generate-key",
         "piv perso import-cert",
         "piv perso self-sign-cert",
+        "piv perso set-mgmt-key",
         "piv perso set-pin",
         "piv perso set-puk",
         "piv perso smoke-test",

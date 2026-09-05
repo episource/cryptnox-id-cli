@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from cryptnox_id_cli.applets.piv import constants as c
+from cryptnox_id_cli.applets.piv import keyimport
 from cryptnox_id_cli.applets.piv import objects as obj
 from cryptnox_id_cli.applets.piv.apt import APTInfo, parse_apt
 from cryptnox_id_cli.transport.apdu import APDU, Response
@@ -43,6 +44,50 @@ def _pin_status_from_sw(ref: int, resp: Response) -> PinStatus:
         return PinStatus(ref, configured=False, blocked=False, verified=False, retries=None)
     # Unknown — report not-configured-ish but keep retries None.
     return PinStatus(ref, configured=False, blocked=False, verified=False, retries=None)
+
+
+@dataclass(frozen=True)
+class MgmtKeyStatus:
+    ref: int
+    mechanism: int | None  # AES mechanism id the key object was found at, or None
+    configured: bool | None  # None: exists, but access rules blocked telling (rare)
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "ref": f"{self.ref:02X}",
+            "mechanism": c.ALGORITHMS.get(self.mechanism) if self.mechanism is not None else None,
+            "configured": self.configured,
+        }
+
+
+# AES-128/192/256 - the only mechanisms the admin key (9B) can hold on this applet.
+_ADMIN_KEY_MECHANISMS = (0x08, 0x0A, 0x0C)
+
+
+def _mgmt_key_status_from_sw(ref: int, mechanism: int, resp: Response) -> MgmtKeyStatus | None:
+    """One mechanism's GENERAL AUTHENTICATE probe result, or None ("no key object
+    at this mechanism - try the next one").
+
+    The probe body (``keyimport.probe_apdu``) shapes a CHALLENGE-with-data plus an
+    empty RESPONSE, i.e. GENERAL AUTHENTICATE's "Internal Authenticate" case. For a
+    ROLE_AUTHENTICATE symmetric key - what this applet always makes the admin key -
+    that shape is invalid once the existence/access/initialised preconditions are
+    behind it, so it lands deterministically on SW 6985. That gives a clean four-way
+    read: 6A86/6A88 no object, 6983 not initialised, 6982 access rules blocked the
+    check itself, 6985 initialised. Anything else is left unclassified rather than
+    assumed initialised.
+    """
+    if resp.sw in (0x6A86, 0x6A88):  # no key object at (ref, mechanism)
+        return None
+    if resp.sw == 0x6983:  # exists, value not initialised
+        return MgmtKeyStatus(ref, mechanism, configured=False)
+    if resp.sw == 0x6982:  # exists, but access rules blocked the check itself
+        return MgmtKeyStatus(ref, mechanism, configured=None)
+    if resp.sw == 0x6985:  # existence + access + initialised all passed
+        return MgmtKeyStatus(ref, mechanism, configured=True)
+    # Key object exists (we're past the 6A86/6A88 branch) but this SW isn't one of
+    # the classified outcomes - report the mechanism without guessing further.
+    return MgmtKeyStatus(ref, mechanism, configured=None)
 
 
 def _pad_pin(pin: bytes) -> bytes:
@@ -169,3 +214,19 @@ class PivApplet:
             APDU(0x00, c.INS_RESET_RETRY, 0x00, ref, data=body),
             context="RESET RETRY COUNTER",
         )
+
+    # -- management key (9B) ------------------------------------------------- #
+    def mgmt_key_status(self, ref: int = c.KEYREF_ADMIN) -> MgmtKeyStatus:
+        """Non-destructive status of the admin key (GENERAL AUTHENTICATE probe,
+        empty challenge - same technique ``keyimport.probe_apdu`` uses to check
+        an asymmetric slot before import; never touches a retry counter, since 9B
+        has none). Tries each AES mechanism this applet supports until one
+        resolves to an existing key object at this reference."""
+        for mechanism in _ADMIN_KEY_MECHANISMS:
+            resp = self.session.transmit(
+                keyimport.probe_apdu(ref, mechanism), context="GENERAL AUTHENTICATE (status)"
+            )
+            status = _mgmt_key_status_from_sw(ref, mechanism, resp)
+            if status is not None:
+                return status
+        return MgmtKeyStatus(ref, mechanism=None, configured=None)

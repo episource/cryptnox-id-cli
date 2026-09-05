@@ -14,6 +14,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   mechanisms.
 - `perso generate-key --create-key-object` - the same dev/eval fallback
   `import-key` already had.
+- `perso set-mgmt-key` - set the PIV management key (9B, AES) via CHANGE
+  REFERENCE DATA ADMIN over SCP03, the same shape as `set-pin`/`set-puk`.
+- `piv status` now reports whether the management key (9B) is set, alongside
+  PIN/PUK status.
 
 ## [1.0.3] - 2026-08-31
 

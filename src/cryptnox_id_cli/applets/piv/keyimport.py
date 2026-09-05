@@ -1,20 +1,22 @@
-"""PIV asymmetric private-key injection (CHANGE REFERENCE DATA ADMIN over SCP03).
+"""PIV private-key injection (CHANGE REFERENCE DATA ADMIN over SCP03).
 
 OpenFIPS201 accepts externally generated key material with ``00 24 <P1=mechanism>
 <P2=key reference>`` carrying exactly ONE key-element TLV per command, so an import
 is a short sequence of admin commands (one fresh SCP03 session each on JCOP 4.5).
 The target key object must already exist with the same (slot, mechanism) pair and
 the IMPORTABLE attribute; RSA objects additionally fix CRT vs plain form at
-creation. A key only becomes usable once both public and private parts are loaded,
-and re-loading an initialised key requires a CLEAR first — every plan therefore
-starts with CLEAR, which makes re-imports idempotent.
+creation. A key only becomes usable once its parts are loaded, and re-loading an
+initialised key requires a CLEAR first — every plan therefore starts with CLEAR,
+which makes re-imports idempotent.
 
-Element tags and exact-length rules (mirrors the applet's PIVKeyECC/PIVKeyRSA):
-CLEAR ``9F`` (empty); ECC public point ``86`` (X9.62 uncompressed, 65/97 bytes) and
-private scalar ``87`` (big-endian right-aligned, 32/48 bytes); RSA modulus ``81``
-(k bytes), public exponent ``82`` (exactly 3 bytes), private exponent ``83``
-(k bytes, plain form only), CRT components ``90``/``91``/``92``/``93``/``94``
-(P/Q/dP/dQ/qInv, each k/2 bytes).
+Element tags and exact-length rules (mirrors the applet's PIVKeyECC/PIVKeyRSA/
+PIVKeySYM): CLEAR ``9F`` (empty); ECC public point ``86`` (X9.62 uncompressed,
+65/97 bytes) and private scalar ``87`` (big-endian right-aligned, 32/48 bytes);
+RSA modulus ``81`` (k bytes), public exponent ``82`` (exactly 3 bytes), private
+exponent ``83`` (k bytes, plain form only), CRT components
+``90``/``91``/``92``/``93``/``94`` (P/Q/dP/dQ/qInv, each k/2 bytes); symmetric
+(AES) key value ``80`` (exactly the key length: 16/24/32 bytes) — the admin key
+(9B) is the only symmetric object this applet exposes.
 """
 
 from __future__ import annotations
@@ -43,6 +45,7 @@ ELEMENT_RSA_Q = 0x91
 ELEMENT_RSA_DP = 0x92
 ELEMENT_RSA_DQ = 0x93
 ELEMENT_RSA_PQ = 0x94
+ELEMENT_SYM_KEY = 0x80  # PIVKeySYM's sole element: the raw secret key value
 
 # Largest TLV body sent as a single (SCP03-wrapped) short APDU; larger bodies go
 # through ISO command chaining. Matches PivAdmin.send_chained's plaintext budget.
@@ -52,6 +55,9 @@ SINGLE_APDU_MAX = 200
 _EC_BY_MECH: dict[int, type[ec.EllipticCurve]] = {0x11: ec.SECP256R1, 0x14: ec.SECP384R1}
 _EC_SCALAR_LEN = {0x11: 32, 0x14: 48}
 _RSA_MODULUS_LEN = {0x07: 256, 0x05: 384, 0x16: 512}
+
+# AES mechanism -> raw key length in bytes (this applet's admin key, 9B, is AES-only).
+_AES_KEY_LEN = {0x08: 16, 0x0A: 24, 0x0C: 32}
 
 # Host-side slot policy (SP 800-78 per-key-reference algorithm table): PKI slots
 # and the retired key history accept the four asymmetric mechanisms; 9B is
@@ -154,6 +160,32 @@ def validate_slot_mechanism(ref: int, mechanism: int) -> None:
         )
     if mechanism not in (*_EC_BY_MECH, *_RSA_MODULUS_LEN):
         raise KeyImportError(f"mechanism {mechanism:#04x} is not an asymmetric mechanism.")
+
+
+def aes_key_len(mechanism: int) -> int | None:
+    """Raw key length in bytes for an AES mechanism id, or ``None`` if not AES."""
+    return _AES_KEY_LEN.get(mechanism)
+
+
+def sym_key_plan(mechanism: int, key_value: bytes) -> list[KeyElement]:
+    """CLEAR, then the raw AES key value — the two commands PIVKeySYM accepts.
+
+    PIVKeySYM has exactly one element (``80``, the raw secret) and refuses it
+    outright (SW 6985) once the key is initialised, so — like the asymmetric
+    plans — this always starts with CLEAR to make re-running idempotent.
+    """
+    expected = aes_key_len(mechanism)
+    if expected is None:
+        raise KeyImportError(f"mechanism {mechanism:#04x} is not a supported AES mechanism.")
+    if len(key_value) != expected:
+        raise KeyImportError(
+            f"AES key value must be exactly {expected} bytes for this mechanism, "
+            f"got {len(key_value)}."
+        )
+    return [
+        KeyElement(ELEMENT_CLEAR, b"", "CLEAR (9F)", False),
+        KeyElement(ELEMENT_SYM_KEY, key_value, "key value (80)", True),
+    ]
 
 
 def encode_exponent(e: int) -> bytes:
